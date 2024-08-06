@@ -47,9 +47,9 @@ import {
   fromModelId,
   ChatMessage as BedrockChatMessage,
 } from "@mirai73/bedrock-fm";
-import { Models } from "@mirai73/bedrock-fm/lib/bedrock";
 import StorageCache from "./cache";
 import Compressor from "compressorjs";
+import { Models } from "@mirai73/bedrock-fm/lib/bedrock";
 
 const ANTHROPIC_HUMAN_PROMPT = "\n\nHuman:";
 const ANTHROPIC_AI_PROMPT = "\n\nAssistant:";
@@ -144,6 +144,7 @@ function get_environ(key: string): string | undefined {
 }
 
 let OPENAI_API_KEY = get_environ("OPENAI_API_KEY");
+let OPENAI_BASE_URL = get_environ("OPENAI_BASE_URL");
 let ANTHROPIC_API_KEY = get_environ("ANTHROPIC_API_KEY");
 let GOOGLE_PALM_API_KEY = get_environ("PALM_API_KEY");
 let AZURE_OPENAI_KEY = get_environ("AZURE_OPENAI_KEY");
@@ -154,6 +155,7 @@ let AWS_ACCESS_KEY_ID = get_environ("AWS_ACCESS_KEY_ID");
 let AWS_SECRET_ACCESS_KEY = get_environ("AWS_SECRET_ACCESS_KEY");
 let AWS_SESSION_TOKEN = get_environ("AWS_SESSION_TOKEN");
 let AWS_REGION = get_environ("AWS_REGION");
+let TOGETHER_API_KEY = get_environ("TOGETHER_API_KEY");
 
 /**
  * Sets the local API keys for the revelant LLM API(s).
@@ -161,12 +163,15 @@ let AWS_REGION = get_environ("AWS_REGION");
 export function set_api_keys(api_keys: Dict<string>): void {
   function key_is_present(name: string): boolean {
     return (
-      name in api_keys &&
-      api_keys[name] !== undefined &&
-      api_keys[name].trim().length > 0
+      (name in api_keys &&
+        api_keys[name] &&
+        api_keys[name].trim().length > 0) ||
+      name === "OpenAI_BaseURL"
     );
   }
   if (key_is_present("OpenAI")) OPENAI_API_KEY = api_keys.OpenAI;
+  if (key_is_present("OpenAI_BaseURL"))
+    OPENAI_BASE_URL = api_keys.OpenAI_BaseURL;
   if (key_is_present("HuggingFace")) HUGGINGFACE_API_KEY = api_keys.HuggingFace;
   if (key_is_present("Anthropic")) ANTHROPIC_API_KEY = api_keys.Anthropic;
   if (key_is_present("Google")) GOOGLE_PALM_API_KEY = api_keys.Google;
@@ -182,6 +187,7 @@ export function set_api_keys(api_keys: Dict<string>): void {
   if (key_is_present("AWS_Session_Token"))
     AWS_SESSION_TOKEN = api_keys.AWS_Session_Token;
   if (key_is_present("AWS_Region")) AWS_REGION = api_keys.AWS_Region;
+  if (key_is_present("Together")) TOGETHER_API_KEY = api_keys.Together;
 }
 
 export function get_azure_openai_api_keys(): [
@@ -234,8 +240,11 @@ export async function call_chatgpt(
       "Could not find an OpenAI API key. Double-check that your API key is set in Settings or in your local environment.",
     );
 
+  console.log(OPENAI_BASE_URL);
+
   const configuration = new OpenAIConfig({
     apiKey: OPENAI_API_KEY,
+    basePath: OPENAI_BASE_URL ?? undefined,
   });
 
   // Since we are running client-side, we need to remove the user-agent header:
@@ -534,7 +543,7 @@ export async function call_anthropic(
   // Required non-standard params
   const max_tokens_to_sample = params?.max_tokens_to_sample ?? 1024;
   const stop_sequences = params?.stop_sequences ?? [ANTHROPIC_HUMAN_PROMPT];
-  const system_msg = params?.system_msg;
+  let system_msg = params?.system_msg;
 
   delete params?.custom_prompt_wrapper;
   delete params?.max_tokens_to_sample;
@@ -545,7 +554,7 @@ export async function call_anthropic(
 
   // Carry chat history
   // :: See https://docs.anthropic.com/claude/docs/human-and-assistant-formatting#use-human-and-assistant-to-put-words-in-claudes-mouth
-  const chat_history: ChatHistory | undefined = params?.chat_history;
+  let chat_history: ChatHistory | undefined = params?.chat_history;
   if (chat_history !== undefined) {
     // FOR OLD TEXT COMPLETIONS API ONLY: Carry chat history by prepending it to the prompt
     if (!use_messages_api) {
@@ -559,6 +568,13 @@ export async function call_anthropic(
         anthr_chat_context += " " + chat_msg.content;
       }
       wrapped_prompt = anthr_chat_context + wrapped_prompt; // prepend the chat context
+    } else {
+      // The new messages API doesn't allow a first "system" message inside chat history, like OpenAI does.
+      // We need to detect a "system" message and eject it:
+      if (chat_history.some((m) => m.role === "system")) {
+        system_msg = chat_history.filter((m) => m.role === "system")[0].content;
+        chat_history = chat_history.filter((m) => m.role !== "system");
+      }
     }
 
     // For newer models Claude 2.1 and Claude 3, we carry chat history directly below; no need to do anything else.
@@ -1344,6 +1360,104 @@ export async function call_bedrock(
   return [query, responses];
 }
 
+/**
+ * Calls Together.ai text + chat models via Together's API.
+   @returns raw query and response JSON dicts.
+ */
+export async function call_together(
+  prompt: string,
+  model: LLM,
+  n = 1,
+  temperature = 1.0,
+  params?: Dict,
+  should_cancel?: () => boolean,
+): Promise<[Dict, Dict]> {
+  if (!TOGETHER_API_KEY)
+    throw new Error(
+      "Could not find an Together API key. Double-check that your API key is set in Settings or in your local environment.",
+    );
+
+  const togetherBaseUrl = "https://api.together.xyz/v1";
+
+  // Together.ai uses OpenAI's API, so we can use the OpenAI API client to make the call:
+  const configuration = new OpenAIConfig({
+    apiKey: TOGETHER_API_KEY,
+    basePath: togetherBaseUrl,
+  });
+
+  // Since we are running client-side, we need to remove the user-agent header:
+  delete configuration.baseOptions.headers["User-Agent"];
+
+  const together = new OpenAIApi(configuration);
+
+  // Strip the "together/" prefix:
+  const modelname: string = model.toString().substring(9);
+  if (
+    params?.stop !== undefined &&
+    (!Array.isArray(params.stop) || params.stop.length === 0)
+  )
+    delete params.stop;
+  if (params?.seed && params.seed.toString().length === 0) delete params?.seed;
+  if (
+    params?.functions !== undefined &&
+    (!Array.isArray(params.functions) || params.functions.length === 0)
+  )
+    delete params?.functions;
+  if (
+    params?.function_call !== undefined &&
+    (!(typeof params.function_call === "string") ||
+      params.function_call.trim().length === 0)
+  )
+    delete params.function_call;
+
+  console.log(
+    `Querying Together model '${modelname}' with prompt '${prompt}'...`,
+  );
+
+  // Determine the system message and whether there's chat history to continue:
+  const chat_history: ChatHistory | undefined = params?.chat_history;
+  const system_msg: string =
+    params?.system_msg !== undefined
+      ? params.system_msg
+      : "You are a helpful assistant.";
+  delete params?.system_msg;
+  delete params?.chat_history;
+
+  const query: Dict = {
+    model: modelname,
+    n,
+    temperature,
+    ...params, // 'the rest' of the settings, passed from the front-end settings
+  };
+
+  // Create call to chat model
+  const together_call: any = together.createChatCompletion.bind(together);
+
+  // Carry over chat history, if present:
+  query.messages = construct_openai_chat_history(
+    prompt,
+    chat_history,
+    system_msg,
+  );
+
+  // Try to call Together
+  let response: Dict = {};
+  try {
+    const completion = await together_call(query);
+    response = completion.data;
+  } catch (error: any) {
+    if (error?.response) {
+      throw new Error(error.response.data?.error?.message);
+      // throw new Error(error.response.status);
+    } else {
+      console.log(error?.message || error);
+      throw new Error(error?.message || error);
+    }
+  }
+
+  return [query, response];
+}
+
 async function call_custom_provider(
   prompt: string,
   model: LLM,
@@ -1428,6 +1542,7 @@ export async function call_llm(
   else if (llm_provider === LLMProvider.Ollama) call_api = call_ollama_provider;
   else if (llm_provider === LLMProvider.Custom) call_api = call_custom_provider;
   else if (llm_provider === LLMProvider.Bedrock) call_api = call_bedrock;
+  else if (llm_provider === LLMProvider.Together) call_api = call_together;
   if (call_api === undefined)
     throw new Error(
       `Adapter for Language model ${llm} and ${llm_provider} not found`,
@@ -1603,6 +1718,8 @@ export function extract_responses(
       return _extract_ollama_responses(response as Dict[]);
     case LLMProvider.Bedrock:
       return response as Array<string>;
+    case LLMProvider.Together:
+      return _extract_openai_responses(response as Dict[]);
     default:
       if (
         Array.isArray(response) &&
